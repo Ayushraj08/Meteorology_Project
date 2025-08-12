@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Flask session & local uploads
+.flask_session/
+instance/
+
+# Environment files
+.env
+*.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+venv/
+.env/
+
+# Uploaded files (keep only sample CSV in repo)
+uploaded_files/*
+!uploaded_files/sample.csv
+
+# Data folder (keep only sample CSVs)
+data/*
+!data/sample.csv
