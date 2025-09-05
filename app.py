@@ -11,13 +11,24 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from threading import Timer
 from waitress import serve
+from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+
+# load .env in development (no error if absent)
+load_dotenv()
 
 # Define the columns that are required in the uploaded CSV files.
 REQUIRED_COLUMNS = ['Altitude', 'Temperature', 'Pressure', 'Humidity', 'Heading', 'Speed']
 
 # Initialize the Flask application.
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'
+
+# Secret key: prefer environment variable
+app.secret_key = os.environ.get("SECRET_KEY", None)
+if not app.secret_key:
+    # In dev only: fallback to temporary key and warn
+    print("WARNING: SECRET_KEY not set. Set SECRET_KEY as an env var for production.")
+    app.secret_key = "dev-temporary-secret"
 
 # Configure server-side session handling to store data in the filesystem.
 app.config['SESSION_TYPE'] = 'filesystem'
@@ -31,6 +42,15 @@ Session(app)
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploaded_files")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Limit uploads to 16 MB by default (adjust if needed)
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
+
+# Allowed extensions
+ALLOWED_EXTENSIONS = {"csv", "txt"}
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Application metadata.
 APP_VERSION = "v2.2"  # Updated version
@@ -109,7 +129,7 @@ def create_analysis_pdf(df):
             ax6 = fig6.add_subplot(111, polar=True)
             wind_df['DirBin'] = pd.cut(wind_df['Heading'], bins=np.arange(0, 361, 30),
                                        labels=np.arange(15, 360, 30), include_lowest=True)
-            rose_data = wind_df.groupby('DirBin').size()
+            rose_data = wind_df.groupby('DirBin', observed=False).size()
             if not rose_data.empty:
                 theta = np.radians(rose_data.index.astype(float))
                 radii = rose_data.values
@@ -191,7 +211,12 @@ def index():
         remove_filename = request.form.get("remove_file")
         if remove_filename:
             filenames = [f for f in filenames if f != remove_filename]
-            session.get('csv_data', {}).pop(remove_filename, None)
+            # remove from session csv_data safely
+            if 'csv_data' in session:
+                session_csv = session['csv_data']
+                if remove_filename in session_csv:
+                    session_csv.pop(remove_filename, None)
+                    session['csv_data'] = session_csv
             session['filenames'] = filenames
             return redirect(url_for("index"))
 
@@ -204,7 +229,14 @@ def index():
 
             for file in uploaded_files:
                 if file.filename:
+                    filename = secure_filename(file.filename)
+                    if not allowed_file(filename):
+                        error = f"File '{file.filename}' has an unsupported extension."
+                        continue
+
                     try:
+                        # read file for processing (safe_read_csv consumes the file stream)
+                        file.seek(0)
                         df = safe_read_csv(file)
 
                         # 🔹 Added: Normalize column names
@@ -239,16 +271,23 @@ def index():
                             error = f"File '{file.filename}' has no usable numeric data."
                             continue
 
-                        save_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+                        # save uploaded file to disk (secure filename)
+                        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                         file.seek(0)
                         file.save(save_path)
+
+                        # store absolute path in session uploaded_files if not exists
                         if save_path not in session['uploaded_files']:
                             session['uploaded_files'].append(save_path)
 
-                        session['csv_data'][file.filename] = df.to_csv(index=False)
-                        df_map[file.filename] = df
-                        if file.filename not in filenames:
-                            filenames.append(file.filename)
+                        # store CSV text in session for quick reload
+                        session_csv = session.get('csv_data', {})
+                        session_csv[filename] = df.to_csv(index=False)
+                        session['csv_data'] = session_csv
+
+                        df_map[filename] = df
+                        if filename not in filenames:
+                            filenames.append(filename)
                     except Exception as e:
                         error = f"Error reading file '{file.filename}': {str(e)}"
 
@@ -328,7 +367,8 @@ def index():
                            last_updated=session.get("last_updated"),
                            app_version=APP_VERSION,
                            developer=DEVELOPER,
-                           wind_rose_image=wind_rose_image)
+                           wind_rose_image=wind_rose_image,
+                           current_year=datetime.now().year)
 
 @app.route('/download/csv')
 def download_csv():
@@ -388,10 +428,20 @@ def find_free_port():
 def open_browser(port):
     webbrowser.open_new(f"http://127.0.0.1:{port}")
 
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    host = "0.0.0.0"
-    from waitress import serve
-    serve(app, host=host, port=port)
-
+if __name__ == '__main__':
+    # If a PORT env var is defined, assume production environment and bind to 0.0.0.0:PORT
+    port_env = os.environ.get("PORT")
+    if port_env:
+        try:
+            port = int(port_env)
+        except Exception:
+            port = 5000
+        host = "0.0.0.0"
+        print(f"Starting (production mode) on {host}:{port}")
+        serve(app, host=host, port=port)
+    else:
+        # Dev mode: find a free local port and open a browser
+        port = find_free_port()
+        Timer(1, open_browser, args=(port,)).start()
+        print(f"Starting (dev mode) on 127.0.0.1:{port}")
+        serve(app, host="127.0.0.1", port=port)
